@@ -48,8 +48,9 @@ use crate::{
         operation::{
             AggregationUpdateJob, AggregationUpdateQueue, CleanupOldEdgesOperation,
             ComputeDirtyAndCleanUpdate, ConnectChildOperation, ExecuteContext, ExecuteContextImpl,
-            Operation, OutdatedEdge, TaskGuard, connect_children, get_aggregation_number,
-            get_uppers, is_root_node, make_task_dirty_internal, prepare_new_children,
+            LeafDistanceUpdateQueue, Operation, OutdatedEdge, TaskGuard, connect_children,
+            get_aggregation_number, get_uppers, is_root_node, make_task_dirty_internal,
+            prepare_new_children,
         },
         storage::{
             InnerStorageSnapshot, Storage, count, get, get_many, get_mut, get_mut_or_insert_with,
@@ -724,10 +725,21 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                     dependent_task = ?reader
                 )
                 .entered();
-                let _ = task.add(CachedDataItem::OutputDependent {
-                    task: reader.unwrap(),
+                let mut queue = LeafDistanceUpdateQueue::new();
+                let reader = reader.unwrap();
+                if task.add(CachedDataItem::OutputDependent {
+                    task: reader,
                     value: (),
-                });
+                }) {
+                    // Ensure that dependent leaf distance is strictly monotonic increasing
+                    let leaf_distance = get!(task, LeafDistance).copied().unwrap_or_default();
+                    let reader_leaf_distance =
+                        get!(reader_task, LeafDistance).copied().unwrap_or_default();
+                    if reader_leaf_distance.min <= leaf_distance.min {
+                        queue.push(reader, leaf_distance.min, leaf_distance.max);
+                    }
+                }
+
                 drop(task);
 
                 // Note: We use `task_pair` earlier to lock the task and its reader at the same
@@ -744,6 +756,9 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                         value: (),
                     });
                 }
+                drop(reader_task);
+
+                queue.execute(&mut ctx);
             }
 
             return result;
@@ -786,6 +801,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         self.assert_not_persistent_calling_transient(reader, task_id, Some(cell));
 
         fn add_cell_dependency(
+            ctx: &mut impl ExecuteContext<'_>,
             task_id: TaskId,
             mut task: impl TaskGuard,
             reader: Option<TaskId>,
@@ -795,11 +811,21 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             if let Some(mut reader_task) = reader_task
                 && (!task.is_immutable() || cfg!(feature = "verify_immutable"))
             {
-                let _ = task.add(CachedDataItem::CellDependent {
+                let mut queue = LeafDistanceUpdateQueue::new();
+                let reader = reader.unwrap();
+                if task.add(CachedDataItem::CellDependent {
                     cell,
-                    task: reader.unwrap(),
+                    task: reader,
                     value: (),
-                });
+                }) {
+                    // Ensure that dependent leaf distance is strictly monotonic increasing
+                    let leaf_distance = get!(task, LeafDistance).copied().unwrap_or_default();
+                    let reader_leaf_distance =
+                        get!(reader_task, LeafDistance).copied().unwrap_or_default();
+                    if reader_leaf_distance.min <= leaf_distance.min {
+                        queue.push(reader, leaf_distance.min, leaf_distance.max);
+                    }
+                }
                 drop(task);
 
                 // Note: We use `task_pair` earlier to lock the task and its reader at the same
@@ -817,6 +843,9 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 {
                     let _ = reader_task.add(CachedDataItem::CellDependency { target, value: () });
                 }
+                drop(reader_task);
+
+                queue.execute(ctx);
             }
         }
 
@@ -848,7 +877,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         };
         if let Some(content) = content {
             if tracking.should_track(false) {
-                add_cell_dependency(task_id, task, reader, reader_task, cell);
+                add_cell_dependency(&mut ctx, task_id, task, reader, reader_task, cell);
             }
             return Ok(Ok(TypedCellContent(
                 cell.type_id,
@@ -875,7 +904,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         .copied();
         let Some(max_id) = max_id else {
             if tracking.should_track(true) {
-                add_cell_dependency(task_id, task, reader, reader_task, cell);
+                add_cell_dependency(&mut ctx, task_id, task, reader, reader_task, cell);
             }
             bail!(
                 "Cell {cell:?} no longer exists in task {} (no cell of this type exists)",
@@ -884,7 +913,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         };
         if cell.index >= max_id {
             if tracking.should_track(true) {
-                add_cell_dependency(task_id, task, reader, reader_task, cell);
+                add_cell_dependency(&mut ctx, task_id, task, reader, reader_task, cell);
             }
             bail!(
                 "Cell {cell:?} no longer exists in task {} (index out of bounds)",
