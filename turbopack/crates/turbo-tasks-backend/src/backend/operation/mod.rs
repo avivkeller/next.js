@@ -3,6 +3,7 @@ mod cleanup_old_edges;
 mod connect_child;
 mod connect_children;
 mod invalidate;
+mod leaf_distance_update;
 mod prepare_new_children;
 mod update_cell;
 mod update_collectible;
@@ -1042,6 +1043,7 @@ pub enum AnyOperation {
     UpdateCell(update_cell::UpdateCellOperation),
     CleanupOldEdges(cleanup_old_edges::CleanupOldEdgesOperation),
     AggregationUpdate(aggregation_update::AggregationUpdateQueue),
+    LeafDistanceUpdate(leaf_distance_update::LeafDistanceUpdateQueue),
     Nested(Vec<AnyOperation>),
 }
 
@@ -1053,6 +1055,7 @@ impl AnyOperation {
             AnyOperation::UpdateCell(op) => op.execute(ctx),
             AnyOperation::CleanupOldEdges(op) => op.execute(ctx),
             AnyOperation::AggregationUpdate(op) => op.execute(ctx),
+            AnyOperation::LeafDistanceUpdate(op) => op.execute(ctx),
             AnyOperation::Nested(ops) => {
                 for op in ops {
                     op.execute(ctx);
@@ -1067,6 +1070,7 @@ impl_operation!(Invalidate invalidate::InvalidateOperation);
 impl_operation!(UpdateCell update_cell::UpdateCellOperation);
 impl_operation!(CleanupOldEdges cleanup_old_edges::CleanupOldEdgesOperation);
 impl_operation!(AggregationUpdate aggregation_update::AggregationUpdateQueue);
+impl_operation!(LeafDistanceUpdate leaf_distance_update::LeafDistanceUpdateQueue);
 
 #[cfg(feature = "trace_task_dirty")]
 pub use self::invalidate::TaskDirtyCause;
