@@ -90,7 +90,7 @@ impl Operation for InvalidateOperation {
 }
 
 #[cfg(feature = "trace_task_dirty")]
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Encode, Decode, Clone, Copy, Debug)]
 pub enum TaskDirtyCause {
     InitialDirty,
     CellChange {
