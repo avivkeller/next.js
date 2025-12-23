@@ -25,7 +25,7 @@ use tokio::time::{Duration, Instant};
 use tracing::{Span, trace_span};
 use turbo_tasks::{
     CellId, FxDashMap, KeyValuePair, RawVc, ReadCellOptions, ReadConsistency, ReadOutputOptions,
-    ReadTracking, TRANSIENT_TASK_BIT, TaskExecutionReason, TaskId, TraitTypeId,
+    ReadTracking, TRANSIENT_TASK_BIT, TaskExecutionReason, TaskId, TaskPriority, TraitTypeId,
     TurboTasksBackendApi, ValueTypeId,
     backend::{
         Backend, CachedTaskType, CellContent, TaskExecutionSpec, TransientTaskRoot,
@@ -1646,6 +1646,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
     fn try_start_task_execution(
         &self,
         task_id: TaskId,
+        priority: TaskPriority,
         turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,
     ) -> Option<TaskExecutionSpec<'_>> {
         enum TaskType {
@@ -1763,7 +1764,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                     arg,
                 } = &*task_type;
                 (
-                    native_fn.span(task_id.persistence(), execution_reason),
+                    native_fn.span(task_id.persistence(), execution_reason, priority),
                     native_fn.execute(*this, &**arg),
                 )
             }
@@ -3260,9 +3261,11 @@ impl<B: BackingStorage> Backend for TurboTasksBackend<B> {
     fn try_start_task_execution(
         &self,
         task_id: TaskId,
+        priority: TaskPriority,
         turbo_tasks: &dyn TurboTasksBackendApi<Self>,
     ) -> Option<TaskExecutionSpec<'_>> {
-        self.0.try_start_task_execution(task_id, turbo_tasks)
+        self.0
+            .try_start_task_execution(task_id, priority, turbo_tasks)
     }
 
     fn task_execution_completed(
