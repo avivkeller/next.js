@@ -2,6 +2,7 @@ import { findSourceMap as nativeFindSourceMap } from 'module'
 import * as path from 'path'
 import * as url from 'url'
 import type * as util from 'util'
+import { readFileSync } from 'node:fs'
 import { SourceMapConsumer as SyncSourceMapConsumer } from 'next/dist/compiled/source-map'
 import {
   type ModernSourceMapPayload,
@@ -11,6 +12,10 @@ import {
 } from './lib/source-maps'
 import { parseStack, type StackFrame } from './lib/parse-stack'
 import { getOriginalCodeFrame } from '../next-devtools/server/shared'
+import {
+  findSourceMapFunctionName,
+  parseFunctionScopes,
+} from './lib/find-source-map-function-name'
 import { workUnitAsyncStorage } from './app-render/work-unit-async-storage.external'
 import { dim, italic } from '../lib/picocolors'
 
@@ -35,7 +40,11 @@ interface IgnorableStackFrame extends StackFrame {
 
 type SourceMapCache = Map<
   string,
-  null | { map: SyncSourceMapConsumer; payload: ModernSourceMapPayload }
+  null | {
+    map: SyncSourceMapConsumer
+    payload: ModernSourceMapPayload
+    functionScopes?: import('./lib/find-source-map-function-name').FunctionScope[]
+  }
 >
 
 function frameToString(
@@ -97,6 +106,90 @@ function shouldIgnoreListGeneratedFrame(file: string): boolean {
 
 function shouldIgnoreListOriginalFrame(file: string): boolean {
   return file.includes('node_modules')
+}
+
+/**
+ * Resolve the original function name from source maps and parsed function scopes.
+ *
+ * NOTE: This requires --enable-source-maps to be set for the source map cache to be populated.
+ * Without this flag, nativeFindSourceMap will return undefined and source maps won't be available.
+ * This is a performance tradeoff - enabling source maps has overhead but provides better stack
+ * traces with actual function names in production.
+ *
+ * @param frame - The original stack frame
+ * @param sourceMapConsumer - The source map consumer for this file
+ * @param sourcePosition - The original source position
+ * @param sourceMapCache - The cache of parsed function scopes
+ * @returns The resolved method name, or the original frame.methodName if resolution fails
+ */
+function resolveFunctionName(
+  frame: SourcemappableStackFrame,
+  sourceMapConsumer: SyncSourceMapConsumer,
+  sourcePosition: {
+    source: string | null
+    line: number | null
+    column: number | null
+  },
+  sourceMapCache: SourceMapCache
+): string {
+  // Lazy-load and parse function scopes from generated source
+  const cacheEntry = sourceMapCache.get(frame.file)
+  if (cacheEntry && cacheEntry.functionScopes === undefined) {
+    // Read generated source and parse function scopes (lazy, cached)
+    try {
+      const generatedSource = readFileSync(frame.file, 'utf-8')
+      cacheEntry.functionScopes = parseFunctionScopes(
+        generatedSource,
+        sourceMapConsumer
+      )
+    } catch (err) {
+      // If we can't read the generated source, set empty array to avoid retrying
+      cacheEntry.functionScopes = []
+    }
+  }
+
+  // Find the actual function name using parsed function scopes
+  let methodName = frame.methodName
+  if (
+    sourcePosition.source !== null &&
+    sourcePosition.line !== null &&
+    sourcePosition.column !== null &&
+    cacheEntry &&
+    cacheEntry.functionScopes
+  ) {
+    // Parse qualified names (e.g., "a.b" -> qualifier="a.", simpleName="b")
+    // This preserves the qualification structure while allowing us to resolve the function name
+    const lastDot = frame.methodName.lastIndexOf('.')
+    const qualifier =
+      lastDot !== -1 ? frame.methodName.substring(0, lastDot + 1) : ''
+    const simpleName =
+      lastDot !== -1
+        ? frame.methodName.substring(lastDot + 1)
+        : frame.methodName
+
+    const foundName = findSourceMapFunctionName(
+      sourceMapConsumer,
+      sourcePosition.source,
+      sourcePosition.line,
+      sourcePosition.column,
+      simpleName,
+      cacheEntry.functionScopes
+    )
+    if (foundName !== undefined) {
+      // Reconstruct qualified name with resolved function name
+      // e.g., "a." + "validate" = "a.validate"
+      methodName = qualifier + foundName
+    }
+  }
+
+  // Fallback to cleaning up the mangled name
+  if (methodName) {
+    methodName = methodName
+      .replace('__WEBPACK_DEFAULT_EXPORT__', 'default')
+      .replace('__webpack_exports__.', '')
+  }
+
+  return methodName
 }
 
 interface SourcemappableStackFrame extends StackFrame {
@@ -282,14 +375,15 @@ function getSourcemappedFrameIfPossible(
     ignored = applicableSourceMap.ignoreList?.includes(sourceIndex) ?? false
   }
 
+  const methodName = resolveFunctionName(
+    frame,
+    sourceMapConsumer,
+    sourcePosition,
+    sourceMapCache
+  )
+
   const originalFrame: IgnorableStackFrame = {
-    // We ignore the sourcemapped name since it won't be the correct name.
-    // The callsite will point to the column of the variable name instead of the
-    // name of the enclosing function.
-    // TODO(NDX-531): Spy on prepareStackTrace to get the enclosing line number for method name mapping.
-    methodName: frame.methodName
-      ?.replace('__WEBPACK_DEFAULT_EXPORT__', 'default')
-      ?.replace('__webpack_exports__.', ''),
+    methodName,
     file: sourcePosition.source,
     line1: sourcePosition.line,
     column1: sourcePosition.column + 1,
