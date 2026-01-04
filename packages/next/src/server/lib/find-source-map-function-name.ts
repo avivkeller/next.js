@@ -80,19 +80,16 @@ export function parseFunctionScopes(
 
         // Try to find the function name in various places
         let mangledName: string | undefined = undefined
-        let namePosition: { line: number; column: number } | undefined =
-          undefined
+        let nameNode: { name: string; loc: any } | undefined = undefined
 
         if (node.type === 'FunctionDeclaration' && node.id) {
           // function foo() {}
-          mangledName = node.id.name
-          namePosition = getPosition(node.id.loc)
+          nameNode = node.id
         } else if (node.type === 'FunctionExpression') {
           // function expression: function foo() {} or function() {}
-          if (node.id && node.id.loc) {
+          if (node.id) {
             // Named function expression
-            mangledName = node.id.name
-            namePosition = getPosition(node.id.loc)
+            nameNode = node.id
           } else {
             // Anonymous function expression - check parent
             const parent = path.parent
@@ -101,16 +98,14 @@ export function parseFunctionScopes(
               parent.id.type === 'Identifier'
             ) {
               // const x = function() {}
-              mangledName = parent.id.name
-              namePosition = getPosition(parent.id.loc)
+              nameNode = parent.id
             } else if (
               (parent.type === 'Property' ||
                 parent.type === 'ObjectProperty') &&
               parent.key.type === 'Identifier'
             ) {
               // { handler: function() {} }
-              mangledName = parent.key.name
-              namePosition = getPosition(parent.key.loc)
+              nameNode = parent.key
             }
           }
         } else if (
@@ -118,8 +113,7 @@ export function parseFunctionScopes(
           node.key.type === 'Identifier'
         ) {
           // { foo() {} } or class { foo() {} }
-          mangledName = node.key.name
-          namePosition = getPosition(node.key.loc)
+          nameNode = node.key
         } else if (node.type === 'ArrowFunctionExpression') {
           // const foo = () => {}
           // Look at parent to find the variable name
@@ -128,13 +122,14 @@ export function parseFunctionScopes(
             parent.type === 'VariableDeclarator' &&
             parent.id.type === 'Identifier'
           ) {
-            mangledName = parent.id.name
-            namePosition = getPosition(parent.id.loc)
+            nameNode = parent.id
           }
         }
 
-        // Check if we have a source map name at this position
-        if (namePosition) {
+        // Check if we have a valid name node with location info
+        if (nameNode?.loc) {
+          mangledName = nameNode.name
+          const namePosition = getPosition(nameNode.loc)
           const key = `${namePosition.line}:${namePosition.column}`
           const originalName = namesByPosition.get(key)
 
@@ -299,7 +294,7 @@ export function findSourceMapFunctionName(
     column: originalColumn,
   })
 
-  if (!generatedPosition.line || !generatedPosition.column) {
+  if (generatedPosition.line === null || generatedPosition.column === null) {
     // Can't map to generated position
     return undefined
   }
