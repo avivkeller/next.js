@@ -1,4 +1,6 @@
 import type { SourceMapConsumer } from 'next/dist/compiled/source-map'
+import { parse } from 'next/dist/compiled/babel/parser'
+import traverse from 'next/dist/compiled/babel/traverse'
 
 /**
  * Represents a function scope in generated code with its boundaries and names.
@@ -63,12 +65,6 @@ export function parseFunctionScopes(
 
   try {
     // Use Babel parser to extract function boundaries
-    const { parse } =
-      require('next/dist/compiled/babel/parser') as typeof import('next/dist/compiled/babel/parser')
-    const traverse = (
-      require('next/dist/compiled/babel/traverse') as typeof import('next/dist/compiled/babel/traverse')
-    ).default
-
     const ast = parse(generatedSource, {
       sourceType: 'unambiguous',
       errorRecovery: true,

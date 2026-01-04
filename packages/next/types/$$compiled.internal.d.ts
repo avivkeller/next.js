@@ -530,6 +530,10 @@ declare module 'next/dist/compiled/babel/code-frame' {
   export * from '@babel/code-frame'
 }
 
+declare module 'next/dist/compiled/babel/parser' {
+  export * from '@babel/parser'
+}
+
 declare module 'next/dist/compiled/@next/font/dist/google' {
   export * from '@next/font/google'
 }
