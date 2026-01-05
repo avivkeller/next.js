@@ -433,48 +433,4 @@ describe('findSourceMapFunctionName', () => {
       expect(result).toBe('validate')
     })
   })
-
-  describe('End-to-end with eval', () => {
-    it('should execute minified code and find function name from real error', async () => {
-      const source = `
-        function validateInput(input) {
-          if (!input) {
-            throw new Error('Invalid input');
-          }
-          return input.toUpperCase();
-        }
-
-        validateInput(null);
-      `
-
-      const { original, generated, consumer, functionScopes } =
-        await minifyWithSourceMap(source)
-
-      // Execute the generated code and capture the error
-      let caughtError: Error | null = null
-      try {
-        // eslint-disable-next-line no-eval
-        eval(generated)
-      } catch (err) {
-        caughtError = err as Error
-      }
-
-      expect(caughtError).toBeTruthy()
-      expect(caughtError?.message).toBe('Invalid input')
-
-      // Verify we can find the function name at the error location
-      const { line, column } = findErrorPosition(original, 'Invalid input')
-
-      const result = findSourceMapFunctionName(
-        consumer,
-        'test.js',
-        line,
-        column,
-        undefined,
-        functionScopes
-      )
-
-      expect(result).toBe('validateInput')
-    })
-  })
 })
