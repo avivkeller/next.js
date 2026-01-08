@@ -1099,7 +1099,9 @@ export async function handleAction({
             } else {
               functionName = actionInfo.exportedName || '<inline action>'
             }
-            const projectDir = ctx.renderOpts.dir || process.cwd()
+            const projectDir =
+              ctx.renderOpts.dir ||
+              (process.env.NEXT_RUNTIME === 'edge' ? '' : process.cwd())
             const filename = normalizeFilePath(projectDir, actionInfo.filename)
 
             // Build location string with line:col if available
