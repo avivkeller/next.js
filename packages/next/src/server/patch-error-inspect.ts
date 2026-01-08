@@ -2,7 +2,6 @@ import { findSourceMap as nativeFindSourceMap } from 'module'
 import * as path from 'path'
 import * as url from 'url'
 import type * as util from 'util'
-import { readFileSync } from 'node:fs'
 import { SourceMapConsumer as SyncSourceMapConsumer } from 'next/dist/compiled/source-map'
 import {
   type ModernSourceMapPayload,
@@ -12,12 +11,78 @@ import {
 } from './lib/source-maps'
 import { parseStack, type StackFrame } from './lib/parse-stack'
 import { getOriginalCodeFrame } from '../next-devtools/server/shared'
-import {
-  findSourceMapFunctionName,
-  parseFunctionScopes,
-} from './lib/find-source-map-function-name'
 import { workUnitAsyncStorage } from './app-render/work-unit-async-storage.external'
 import { dim, italic } from '../lib/picocolors'
+
+/**
+ * V8 CallSite interface for structured stack traces.
+ * @see https://v8.dev/docs/stack-trace-api
+ */
+interface CallSite {
+  getThis(): unknown
+  getTypeName(): string | null
+  getFunction(): Function | undefined
+  getFunctionName(): string | null
+  getMethodName(): string | null
+  getFileName(): string | undefined
+  getLineNumber(): number | null
+  getColumnNumber(): number | null
+  getEvalOrigin(): string | undefined
+  isToplevel(): boolean
+  isEval(): boolean
+  isNative(): boolean
+  isConstructor(): boolean
+  isAsync(): boolean
+  isPromiseAll(): boolean
+  getPromiseIndex(): number | null
+  // V8-specific methods for getting enclosing function location
+  // These may not be available in all runtimes (e.g., Bun)
+  getEnclosingLineNumber?(): number | null
+  getEnclosingColumnNumber?(): number | null
+  toString(): string
+}
+
+/**
+ * Captured stack frame data from V8 CallSite objects.
+ * This preserves the structured data so we don't need to parse stack strings later.
+ */
+interface CapturedFrame {
+  /** Function name from getFunctionName() or getMethodName() */
+  functionName: string | undefined
+  /** Type name from getTypeName() for qualified names like "Foo.bar" */
+  typeName: string | undefined
+  /** File name from getFileName() */
+  fileName: string | undefined
+  /** Line number of the call site (1-indexed) */
+  lineNumber: number | undefined
+  /** Column number of the call site (1-indexed) */
+  columnNumber: number | undefined
+  /** Line number where the enclosing function is defined (1-indexed), V8-specific */
+  enclosingLineNumber: number | undefined
+  /** Column number where the enclosing function is defined (1-indexed), V8-specific */
+  enclosingColumnNumber: number | undefined
+  /** Whether this is an async function call */
+  isAsync: boolean
+  /** Whether this is a constructor call (new Foo()) */
+  isConstructor: boolean
+}
+
+/**
+ * Captured stack trace information stored in WeakMap keyed by Error object.
+ */
+interface CapturedStackTrace {
+  /** Error name computed at capture time */
+  name: string
+  /** Captured frames from CallSite objects */
+  frames: CapturedFrame[]
+}
+
+/**
+ * WeakMap to store captured stack trace data keyed by Error object.
+ * This allows us to access the structured CallSite data later during inspection
+ * without needing to parse the stack string.
+ */
+const capturedStackTraces = new WeakMap<Error, CapturedStackTrace>()
 
 type FindSourceMapPayload = (
   sourceURL: string
@@ -38,12 +103,19 @@ interface IgnorableStackFrame extends StackFrame {
   ignored: boolean
 }
 
+/**
+ * Name mappings indexed by generated line number.
+ * Each entry is an array of {column, name} sorted by column.
+ */
+type NameMappingsByLine = Map<number, Array<{ column: number; name: string }>>
+
 type SourceMapCache = Map<
   string,
   null | {
     map: SyncSourceMapConsumer
     payload: ModernSourceMapPayload
-    functionScopes?: import('./lib/find-source-map-function-name').FunctionScope[]
+    /** Cached name mappings for efficient lookup */
+    nameMappings?: NameMappingsByLine
   }
 >
 
@@ -87,12 +159,36 @@ function computeErrorName(error: Error): string {
   return error.name || 'Error'
 }
 
+/**
+ * Capture a CallSite object into a plain object for later use.
+ */
+function captureCallSite(callSite: CallSite): CapturedFrame {
+  return {
+    functionName:
+      callSite.getFunctionName() ?? callSite.getMethodName() ?? undefined,
+    typeName: callSite.getTypeName() ?? undefined,
+    fileName: callSite.getFileName(),
+    lineNumber: callSite.getLineNumber() ?? undefined,
+    columnNumber: callSite.getColumnNumber() ?? undefined,
+    // These V8-specific methods may not exist in all runtimes (e.g., Bun)
+    enclosingLineNumber: callSite.getEnclosingLineNumber?.() ?? undefined,
+    enclosingColumnNumber: callSite.getEnclosingColumnNumber?.() ?? undefined,
+    isAsync: callSite.isAsync(),
+    isConstructor: callSite.isConstructor(),
+  }
+}
+
 function prepareUnsourcemappedStackTrace(
   error: Error,
-  structuredStackTrace: any[]
+  structuredStackTrace: CallSite[]
 ): string {
   const name = computeErrorName(error)
   const message = error.message || ''
+
+  // Capture the structured stack trace data for later source mapping
+  const frames = structuredStackTrace.map(captureCallSite)
+  capturedStackTraces.set(error, { name, frames })
+
   let stack = name + ': ' + message
   for (let i = 0; i < structuredStackTrace.length; i++) {
     stack += '\n    at ' + structuredStackTrace[i].toString()
@@ -109,80 +205,112 @@ function shouldIgnoreListOriginalFrame(file: string): boolean {
 }
 
 /**
- * Resolve the original function name from source maps and parsed function scopes.
+ * Build a cached lookup structure for name mappings from a source map.
+ * This allows efficient name lookups without iterating all mappings each time.
+ */
+function buildNameMappings(
+  sourceMapConsumer: SyncSourceMapConsumer
+): NameMappingsByLine {
+  const nameMappings: NameMappingsByLine = new Map()
+
+  sourceMapConsumer.eachMapping((mapping) => {
+    if (!mapping.name) return
+
+    let lineEntries = nameMappings.get(mapping.generatedLine)
+    if (!lineEntries) {
+      lineEntries = []
+      nameMappings.set(mapping.generatedLine, lineEntries)
+    }
+    lineEntries.push({ column: mapping.generatedColumn, name: mapping.name })
+  })
+
+  // Sort each line's entries by column for efficient searching
+  for (const entries of nameMappings.values()) {
+    entries.sort((a, b) => a.column - b.column)
+  }
+
+  return nameMappings
+}
+
+/**
+ * Find the closest name near the given position on the same line.
+ * Searches both forward (for `function foo`) and backward (for `const foo = () =>`).
+ */
+function findNameAtPosition(
+  nameMappings: NameMappingsByLine,
+  line: number,
+  column: number
+): string | undefined {
+  const lineEntries = nameMappings.get(line)
+  if (!lineEntries || lineEntries.length === 0) return undefined
+
+  // Search window: function identifiers are typically within ~30 chars
+  // Forward: `function foo` or `async function foo`
+  // Backward: `const foo = () =>` where enclosing points to `()`
+  const searchRadius = 30
+
+  let closestName: string | undefined
+  let closestDistance = Infinity
+
+  for (const entry of lineEntries) {
+    const distance = Math.abs(entry.column - column)
+    if (distance <= searchRadius && distance < closestDistance) {
+      closestDistance = distance
+      closestName = entry.name
+    }
+  }
+
+  return closestName
+}
+
+/**
+ * Resolve the original function name using V8's enclosing function position.
  *
- * NOTE: This requires --enable-source-maps to be set for the source map cache to be populated.
- * Without this flag, nativeFindSourceMap will return undefined and source maps won't be available.
- * This is a performance tradeoff - enabling source maps has overhead but provides better stack
- * traces with actual function names in production.
+ * This uses the enclosingLineNumber/enclosingColumnNumber from V8 CallSite objects
+ * to find where the function was defined in generated code, then searches for a
+ * name mapping near that position in the source map.
  *
- * @param frame - The original stack frame
- * @param sourceMapConsumer - The source map consumer for this file
- * @param sourcePosition - The original source position
- * @param sourceMapCache - The cache of parsed function scopes
- * @returns The resolved method name, or the original frame.methodName if resolution fails
+ * The challenge is that V8 points to the start of the function (e.g., `function` keyword),
+ * but the name mapping in source maps is typically at the identifier position. We search
+ * forward from the enclosing position to find the nearest name.
+ *
+ * @param capturedFrame - The captured frame with enclosing position info
+ * @param nameMappings - Cached name mappings from the source map
+ * @param mangledName - The mangled function name from the stack trace (already formatted with typeName and async)
+ * @returns The resolved function name, or the mangled name if resolution fails
  */
 function resolveFunctionName(
-  frame: SourcemappableStackFrame,
-  sourceMapConsumer: SyncSourceMapConsumer,
-  sourcePosition: {
-    source: string | null
-    line: number | null
-    column: number | null
-  },
-  sourceMapCache: SourceMapCache
+  capturedFrame: CapturedFrame,
+  nameMappings: NameMappingsByLine | undefined,
+  mangledName: string
 ): string {
-  // Lazy-load and parse function scopes from generated source
-  const cacheEntry = sourceMapCache.get(frame.file)
-  if (cacheEntry && cacheEntry.functionScopes === undefined) {
-    // Read generated source and parse function scopes (lazy, cached)
-    try {
-      const generatedSource = readFileSync(frame.file, 'utf-8')
-      cacheEntry.functionScopes = parseFunctionScopes(
-        generatedSource,
-        sourceMapConsumer
-      )
-    } catch (err) {
-      // If we can't read the generated source, set empty array to avoid retrying
-      cacheEntry.functionScopes = []
-    }
-  }
-
-  // Find the actual function name using parsed function scopes
-  let methodName = frame.methodName
+  // Try to find the original function name using the enclosing function position
+  // This is only available in V8 (Node.js), not in Bun (JSC)
   if (
-    sourcePosition.source !== null &&
-    sourcePosition.line !== null &&
-    sourcePosition.column !== null &&
-    cacheEntry &&
-    cacheEntry.functionScopes
+    capturedFrame.enclosingLineNumber !== undefined &&
+    capturedFrame.enclosingColumnNumber !== undefined &&
+    nameMappings
   ) {
-    // Parse qualified names (e.g., "a.b" -> qualifier="a.", simpleName="b")
-    // This preserves the qualification structure while allowing us to resolve the function name
-    const lastDot = frame.methodName.lastIndexOf('.')
-    const qualifier =
-      lastDot !== -1 ? frame.methodName.substring(0, lastDot + 1) : ''
-    const simpleName =
-      lastDot !== -1
-        ? frame.methodName.substring(lastDot + 1)
-        : frame.methodName
-
-    const foundName = findSourceMapFunctionName(
-      sourceMapConsumer,
-      sourcePosition.source,
-      sourcePosition.line,
-      sourcePosition.column,
-      simpleName,
-      cacheEntry.functionScopes
+    const foundName = findNameAtPosition(
+      nameMappings,
+      capturedFrame.enclosingLineNumber,
+      capturedFrame.enclosingColumnNumber - 1 // Convert to 0-indexed
     )
-    if (foundName !== undefined) {
-      // Reconstruct qualified name with resolved function name
-      // e.g., "a." + "validate" = "a.validate"
-      methodName = qualifier + foundName
+
+    if (foundName) {
+      // Found the original function name in the source map
+      // Format it with typeName and async/constructor prefixes to match the mangledName format
+      return formatMethodName(
+        foundName,
+        capturedFrame.typeName,
+        capturedFrame.isAsync,
+        capturedFrame.isConstructor
+      )
     }
   }
 
-  // Fallback to cleaning up the mangled name
+  // Fallback: clean up the mangled name (which already has typeName and async)
+  let methodName = mangledName
   if (methodName) {
     methodName = methodName
       .replace('__WEBPACK_DEFAULT_EXPORT__', 'default')
@@ -192,27 +320,67 @@ function resolveFunctionName(
   return methodName
 }
 
-interface SourcemappableStackFrame extends StackFrame {
-  file: NonNullable<StackFrame['file']>
-}
-
 interface SourceMappedFrame {
   stack: IgnorableStackFrame
   // DEV only
   code: string | null
 }
 
-function createUnsourcemappedFrame(
-  frame: SourcemappableStackFrame
-): SourceMappedFrame {
+/**
+ * Format a method name with optional type name prefix and async/constructor modifiers.
+ * V8 uses the format "[async] [new] TypeName.methodName" for method calls.
+ */
+function formatMethodName(
+  functionName: string | undefined,
+  typeName: string | undefined,
+  isAsync: boolean,
+  isConstructor: boolean = false
+): string {
+  let methodName: string
+  if (functionName) {
+    // Include typeName if present (e.g., "Object.then", "Promise.resolve")
+    // This matches V8's native formatting
+    if (typeName && typeName !== 'global') {
+      methodName = typeName + '.' + functionName
+    } else {
+      methodName = functionName
+    }
+  } else {
+    methodName = '<anonymous>'
+  }
+
+  // Add "new " prefix for constructor calls (before async)
+  if (isConstructor && !methodName.startsWith('new ')) {
+    methodName = 'new ' + methodName
+  }
+
+  // Preserve the "async" prefix for async functions
+  if (isAsync && !methodName.startsWith('async ')) {
+    methodName = 'async ' + methodName
+  }
+
+  return methodName
+}
+
+/**
+ * Create an unsourcemapped frame from a captured frame.
+ */
+function createUnsourcemappedFrame(frame: CapturedFrame): SourceMappedFrame {
+  const file = frame.fileName ?? null
+  const methodName = formatMethodName(
+    frame.functionName,
+    frame.typeName,
+    frame.isAsync,
+    frame.isConstructor
+  )
   return {
     stack: {
-      file: frame.file,
-      line1: frame.line1,
-      column1: frame.column1,
-      methodName: frame.methodName,
-      arguments: frame.arguments,
-      ignored: shouldIgnoreListGeneratedFrame(frame.file),
+      file,
+      line1: frame.lineNumber ?? null,
+      column1: frame.columnNumber ?? null,
+      methodName,
+      arguments: [],
+      ignored: file !== null && shouldIgnoreListGeneratedFrame(file),
     },
     code: null,
   }
@@ -236,32 +404,36 @@ function ignoreListAnonymousStackFramesIfSandwiched(
 }
 
 /**
- * @param frame
- * @param sourceMapCache
- * @returns The original frame if not sourcemapped.
+ * Source map a captured frame if possible.
+ * @param capturedFrame - The captured frame from V8 CallSite
+ * @param sourceMapCache - Cache for source map consumers
+ * @param inspectOptions - Node.js inspect options
+ * @returns The source mapped frame, or unsourcemapped frame if mapping fails
  */
 function getSourcemappedFrameIfPossible(
-  frame: SourcemappableStackFrame,
+  capturedFrame: CapturedFrame,
   sourceMapCache: SourceMapCache,
   inspectOptions: util.InspectOptions
-): {
-  stack: IgnorableStackFrame
-  code: string | null
-} {
-  const sourceMapCacheEntry = sourceMapCache.get(frame.file)
+): SourceMappedFrame {
+  const fileName = capturedFrame.fileName
+  if (fileName === undefined) {
+    return createUnsourcemappedFrame(capturedFrame)
+  }
+
+  const sourceMapCacheEntry = sourceMapCache.get(fileName)
   let sourceMapConsumer: SyncSourceMapConsumer
   let sourceMapPayload: ModernSourceMapPayload
   if (sourceMapCacheEntry === undefined) {
-    let sourceURL = frame.file
+    let sourceURL = fileName
     // e.g. "/Users/foo/APP/.next/server/chunks/ssr/[root-of-the-server]__2934a0._.js"
     // or "C:\Users\foo\APP\.next\server\chunks\ssr\[root-of-the-server]__2934a0._.js"
     // will be keyed by Node.js as "file:///APP/.next/server/chunks/ssr/[root-of-the-server]__2934a0._.js".
     // This is likely caused by `callsite.toString()` in `Error.prepareStackTrace converting file URLs to paths.
     //
-    // But frame.file might also be "webpack-internal:///(rsc)/./app/bad-sourcemap/page.js" or
+    // But fileName might also be "webpack-internal:///(rsc)/./app/bad-sourcemap/page.js" or
     // "<anonymous>" or "node:internal/process/task_queues" here
-    if (path.isAbsolute(frame.file)) {
-      sourceURL = url.pathToFileURL(frame.file).toString()
+    if (path.isAbsolute(fileName)) {
+      sourceURL = url.pathToFileURL(fileName).toString()
     }
     let maybeSourceMapPayload: ModernSourceMapPayload | undefined
     try {
@@ -275,21 +447,21 @@ function getSourcemappedFrameIfPossible(
       )
       // If loading fails once, it'll fail every time.
       // So set the cache to avoid duplicate errors.
-      sourceMapCache.set(frame.file, null)
+      sourceMapCache.set(fileName, null)
       // Don't even fall back to the bundler because it might be not as strict
       // with regards to parsing and then we fail later once we consume the
       // source map payload.
       // This essentially avoids a redundant error where we fail here and then
       // later on consumption because the bundler just handed back an invalid
       // source map.
-      return createUnsourcemappedFrame(frame)
+      return createUnsourcemappedFrame(capturedFrame)
     }
     if (maybeSourceMapPayload === undefined) {
       maybeSourceMapPayload = bundlerFindSourceMapPayload(sourceURL)
     }
 
     if (maybeSourceMapPayload === undefined) {
-      return createUnsourcemappedFrame(frame)
+      return createUnsourcemappedFrame(capturedFrame)
     }
     sourceMapPayload = maybeSourceMapPayload
     try {
@@ -312,45 +484,62 @@ function getSourcemappedFrameIfPossible(
       )
       // If creating the consumer fails once, it'll fail every time.
       // So set the cache to avoid duplicate errors.
-      sourceMapCache.set(frame.file, null)
-      return createUnsourcemappedFrame(frame)
+      sourceMapCache.set(fileName, null)
+      return createUnsourcemappedFrame(capturedFrame)
     }
-    sourceMapCache.set(frame.file, {
+    sourceMapCache.set(fileName, {
       map: sourceMapConsumer,
       payload: sourceMapPayload,
+      nameMappings: buildNameMappings(sourceMapConsumer),
     })
   } else if (sourceMapCacheEntry === null) {
     // We failed earlier getting the payload or consumer.
     // Just return an unsourcemapped frame.
     // Errors will already be logged.
-    return createUnsourcemappedFrame(frame)
+    return createUnsourcemappedFrame(capturedFrame)
   } else {
     sourceMapConsumer = sourceMapCacheEntry.map
     sourceMapPayload = sourceMapCacheEntry.payload
   }
 
+  // Get or build the name mappings for this source map
+  const cacheEntry = sourceMapCache.get(fileName)
+  const nameMappings = cacheEntry?.nameMappings
+
+  const lineNumber = capturedFrame.lineNumber ?? 1
+  const columnNumber = capturedFrame.columnNumber ?? 1
+
   const sourcePosition = sourceMapConsumer.originalPositionFor({
-    column: (frame.column1 ?? 1) - 1,
-    line: frame.line1 ?? 1,
+    column: columnNumber - 1,
+    line: lineNumber,
   })
 
   const applicableSourceMap = findApplicableSourceMapPayload(
-    (frame.line1 ?? 1) - 1,
-    (frame.column1 ?? 1) - 1,
+    lineNumber - 1,
+    columnNumber - 1,
     sourceMapPayload
   )
   let ignored =
     applicableSourceMap !== undefined &&
     sourceMapIgnoreListsEverything(applicableSourceMap)
+
+  // Compute the full mangled name including typeName and constructor prefix for proper formatting
+  const mangledName = formatMethodName(
+    capturedFrame.functionName,
+    capturedFrame.typeName,
+    capturedFrame.isAsync,
+    capturedFrame.isConstructor
+  )
+
   if (sourcePosition.source === null) {
     return {
       stack: {
-        arguments: frame.arguments,
-        file: frame.file,
-        line1: frame.line1,
-        column1: frame.column1,
-        methodName: frame.methodName,
-        ignored: ignored || shouldIgnoreListGeneratedFrame(frame.file),
+        arguments: [],
+        file: fileName,
+        line1: lineNumber,
+        column1: columnNumber,
+        methodName: mangledName,
+        ignored: ignored || shouldIgnoreListGeneratedFrame(fileName),
       },
       code: null,
     }
@@ -358,7 +547,10 @@ function getSourcemappedFrameIfPossible(
 
   // TODO(veil): Upstream a method to sourcemap consumer that immediately says if a frame is ignored or not.
   if (applicableSourceMap === undefined) {
-    console.error('No applicable source map found in sections for frame', frame)
+    console.error(
+      'No applicable source map found in sections for frame',
+      capturedFrame
+    )
   } else if (!ignored && shouldIgnoreListOriginalFrame(sourcePosition.source)) {
     // Externals may be libraries that don't ship ignoreLists.
     // This is really taking control away from libraries.
@@ -375,19 +567,19 @@ function getSourcemappedFrameIfPossible(
     ignored = applicableSourceMap.ignoreList?.includes(sourceIndex) ?? false
   }
 
+  // The mangledName already includes async prefix and typeName from formatMethodName
+  // resolveFunctionName may return a deobfuscated name that also needs these
   const methodName = resolveFunctionName(
-    frame,
-    sourceMapConsumer,
-    sourcePosition,
-    sourceMapCache
+    capturedFrame,
+    nameMappings,
+    mangledName
   )
 
   const originalFrame: IgnorableStackFrame = {
     methodName,
     file: sourcePosition.source,
     line1: sourcePosition.line,
-    column1: sourcePosition.column + 1,
-    // TODO: c&p from async createOriginalStackFrame but why not frame.arguments?
+    column1: sourcePosition.column !== null ? sourcePosition.column + 1 : null,
     arguments: [],
     ignored,
   }
@@ -426,28 +618,68 @@ function parseAndSourceMap(
   inspectOptions: util.InspectOptions
 ): string {
   const showIgnoreListed = process.env.__NEXT_SHOW_IGNORE_LISTED === 'true'
-  // We overwrote Error.prepareStackTrace earlier so error.stack is not sourcemapped.
-  let unparsedStack = String(error.stack)
-  // We could just read it from `error.stack`.
-  // This works around cases where a 3rd party `Error.prepareStackTrace` implementation
-  // doesn't implement the name computation correctly.
-  const errorName = computeErrorName(error)
 
-  let idx = unparsedStack.indexOf('react_stack_bottom_frame')
-  if (idx !== -1) {
-    idx = unparsedStack.lastIndexOf('\n', idx)
+  // Access error.stack to ensure prepareStackTrace is called and captures the stack data.
+  // The stack property is lazily computed, so this triggers the capture.
+  const stackString = error.stack
+
+  // Get the captured stack trace data from the WeakMap
+  const capturedStack = capturedStackTraces.get(error)
+  const errorName = capturedStack?.name ?? computeErrorName(error)
+
+  // Get frames from captured data, or fall back to parsing the stack string.
+  // The WeakMap lookup can fail when error objects are cloned/serialized
+  // across process boundaries (e.g., during prerendering).
+  let frames: CapturedFrame[]
+  if (capturedStack && capturedStack.frames.length > 0) {
+    frames = capturedStack.frames
+  } else if (stackString) {
+    // Parse the stack string to extract frames for filtering.
+    // Wrap in try-catch to avoid infinite recursion if parsing fails.
+    let parsedFrames: StackFrame[]
+    try {
+      parsedFrames = parseStack(stackString)
+    } catch {
+      // If parsing fails, return the original stack string as-is
+      return stackString
+    }
+    frames = parsedFrames.map((frame) => {
+      // Check if the method name starts with "async " or "new " to detect async/constructor calls
+      let methodName = frame.methodName ?? ''
+      const isAsync = methodName.startsWith('async ')
+      if (isAsync) {
+        methodName = methodName.slice(6) // Remove "async " prefix
+      }
+      const isConstructor = methodName.startsWith('new ')
+      if (isConstructor) {
+        methodName = methodName.slice(4) // Remove "new " prefix
+      }
+      return {
+        functionName: methodName || undefined,
+        typeName: undefined,
+        fileName: frame.file ?? undefined,
+        lineNumber: frame.line1 ?? undefined,
+        columnNumber: frame.column1 ?? undefined,
+        enclosingLineNumber: undefined,
+        enclosingColumnNumber: undefined,
+        isAsync,
+        isConstructor,
+      }
+    })
   } else {
-    idx = unparsedStack.indexOf('react-stack-bottom-frame')
-    if (idx !== -1) {
-      idx = unparsedStack.lastIndexOf('\n', idx)
+    return `${errorName}: ${error.message}`
+  }
+  if (!showIgnoreListed) {
+    const reactBottomIdx = frames.findIndex(
+      (f) =>
+        f.functionName?.includes('react_stack_bottom_frame') ||
+        f.functionName?.includes('react-stack-bottom-frame')
+    )
+    if (reactBottomIdx !== -1) {
+      frames = frames.slice(0, reactBottomIdx)
     }
   }
-  if (idx !== -1 && !showIgnoreListed) {
-    // Cut off everything after the bottom frame since it'll be React internals.
-    unparsedStack = unparsedStack.slice(0, idx)
-  }
 
-  const unsourcemappedStack = parseStack(unparsedStack)
   const sourceMapCache: SourceMapCache = new Map()
 
   const sourceMappedFrames: Array<{
@@ -455,39 +687,24 @@ function parseAndSourceMap(
     code: string | null
   }> = []
   let sourceFrame: null | string = null
-  for (const frame of unsourcemappedStack) {
-    if (frame.file === null) {
-      sourceMappedFrames.push({
-        code: null,
-        stack: {
-          file: frame.file,
-          line1: frame.line1,
-          column1: frame.column1,
-          methodName: frame.methodName,
-          arguments: frame.arguments,
-          ignored: false,
-        },
-      })
-    } else {
-      const sourcemappedFrame = getSourcemappedFrameIfPossible(
-        // We narrowed this earlier by bailing if `frame.file` is null.
-        frame as SourcemappableStackFrame,
-        sourceMapCache,
-        inspectOptions
-      )
-      sourceMappedFrames.push(sourcemappedFrame)
+  for (const frame of frames) {
+    const sourcemappedFrame = getSourcemappedFrameIfPossible(
+      frame,
+      sourceMapCache,
+      inspectOptions
+    )
+    sourceMappedFrames.push(sourcemappedFrame)
 
-      // We can determine the sourceframe here.
-      // anonymous frames won't have a sourceframe so we don't need to scan
-      // all stacks again to check if they are sandwiched between ignored frames.
-      if (
-        sourceFrame === null &&
-        // TODO: Is this the right choice?
-        !sourcemappedFrame.stack.ignored &&
-        sourcemappedFrame.code !== null
-      ) {
-        sourceFrame = sourcemappedFrame.code
-      }
+    // We can determine the sourceframe here.
+    // anonymous frames won't have a sourceframe so we don't need to scan
+    // all stacks again to check if they are sandwiched between ignored frames.
+    if (
+      sourceFrame === null &&
+      // TODO: Is this the right choice?
+      !sourcemappedFrame.stack.ignored &&
+      sourcemappedFrame.code !== null
+    ) {
+      sourceFrame = sourcemappedFrame.code
     }
   }
 
