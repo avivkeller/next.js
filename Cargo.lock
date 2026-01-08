@@ -9373,6 +9373,7 @@ name = "turbo-tasks-fetch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "mockito",
  "quick_cache",
  "reqwest",
