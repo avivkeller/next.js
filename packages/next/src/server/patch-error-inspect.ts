@@ -167,7 +167,7 @@ function captureCallSite(callSite: CallSite): CapturedFrame {
     functionName:
       callSite.getFunctionName() ?? callSite.getMethodName() ?? undefined,
     typeName: callSite.getTypeName() ?? undefined,
-    fileName: callSite.getFileName(),
+    fileName: callSite.getFileName() ?? undefined,
     lineNumber: callSite.getLineNumber() ?? undefined,
     columnNumber: callSite.getColumnNumber() ?? undefined,
     // These V8-specific methods may not exist in all runtimes (e.g., Bun)
